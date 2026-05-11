@@ -1,10 +1,8 @@
 #include <FastLED.h>
 #include "driver/spi_slave.h"
-#include "esp_heap_caps.h"
 
 #define WIDTH 128
 #define HEIGHT 64
-#define PACKET_SIZE (6 + (WIDTH * 3))
 
 #define DATA_PIN_1 15
 #define DATA_PIN_2 2
@@ -16,6 +14,10 @@
 #define PIN_SCLK 18
 #define PIN_CS   5
 
+#define READY_PIN 4
+
+#define PACKET_SIZE 512
+
 CRGB leds1[2048];
 CRGB leds2[2048];
 CRGB leds3[2048];
@@ -23,54 +25,100 @@ CRGB leds4[2048];
 
 CRGB* ledMap[WIDTH * HEIGHT];
 
-uint8_t* rxBuf;
-uint8_t* safeBuf;
+static uint8_t rxBuf[PACKET_SIZE] __attribute__((aligned(32)));
+
 spi_slave_transaction_t t;
 
-// ---------------- CRC16
-uint16_t crc16(const uint8_t* data, int len) {
+// ---------------- FRAME BUFFER ----------------
+CRGB frame[HEIGHT][WIDTH];
+bool rowReceived[HEIGHT];
+int receivedCount = 0;
 
-  uint16_t crc = 0xFFFF;
+// -----------------------------
+void buildMap() {
 
-  for (int i = 0; i < len; i++) {
+  for (int y = 0; y < HEIGHT; y++) {
+    for (int x = 0; x < WIDTH; x++) {
 
-    crc ^= data[i];
+      int px = x / 16;
+      int py = y / 16;
 
-    for (int j = 0; j < 8; j++) {
-      crc = (crc & 1)
-        ? (crc >> 1) ^ 0xA001
-        : crc >> 1;
+      int lx = x % 16;
+      int ly = y % 16;
+
+      int idx = (lx % 2 == 0)
+        ? lx * 16 + ly
+        : lx * 16 + (15 - ly);
+
+      int ledIndex = px * 256 + idx;
+
+      if (py == 0) ledMap[y * WIDTH + x] = &leds1[ledIndex];
+      else if (py == 1) ledMap[y * WIDTH + x] = &leds2[ledIndex];
+      else if (py == 2) ledMap[y * WIDTH + x] = &leds3[ledIndex];
+      else ledMap[y * WIDTH + x] = &leds4[ledIndex];
     }
   }
-
-  return crc;
 }
 
-// ---------------- APPLY ROW
-void applyRow(uint8_t* buf) {
+// ---------------- PROCESS PACKET ----------------
+void processPacket(uint8_t* buf) {
+
+  if (buf[0] != 0xA5 || buf[1] != 0x5A) return;
 
   uint8_t row = buf[2];
+  uint8_t width = buf[3];
 
-  int i = 6;
-  int base = row * WIDTH;
+  if (row >= HEIGHT || width != WIDTH) return;
+
+  int i = 4;
 
   for (int x = 0; x < WIDTH; x++) {
 
-    ledMap[base + x]->setRGB(
-      buf[i],
-      buf[i + 1],
-      buf[i + 2]
-    );
-
-    i += 3;
+    frame[row][x].r = buf[i++];
+    frame[row][x].g = buf[i++];
+    frame[row][x].b = buf[i++];
   }
+
+  if (!rowReceived[row]) {
+    rowReceived[row] = true;
+    receivedCount++;
+  }
+
+  Serial.printf("ROW %d STORED (%d/64)\n", row, receivedCount);
 }
 
-// ---------------- SETUP
+// ---------------- RENDER FULL FRAME ----------------
+void renderFrame() {
+
+  for (int y = 0; y < HEIGHT; y++) {
+    for (int x = 0; x < WIDTH; x++) {
+
+      *ledMap[y * WIDTH + x] = frame[y][x];
+    }
+  }
+
+  FastLED.show();
+
+  Serial.println("FRAME RENDERED");
+}
+
+// ---------------- RESET FRAME STATE ----------------
+void resetFrame() {
+
+  for (int i = 0; i < HEIGHT; i++) {
+    rowReceived[i] = false;
+  }
+
+  receivedCount = 0;
+}
+
+// ---------------- SETUP ----------------
 void setup() {
 
   Serial.begin(115200);
-  Serial.println("BOOT");
+
+  pinMode(READY_PIN, OUTPUT);
+  digitalWrite(READY_PIN, LOW);
 
   FastLED.addLeds<WS2812B, DATA_PIN_1, GRB>(leds1, 2048);
   FastLED.addLeds<WS2812B, DATA_PIN_2, GRB>(leds2, 2048);
@@ -79,8 +127,7 @@ void setup() {
 
   FastLED.setBrightness(10);
 
-  rxBuf = (uint8_t*) heap_caps_malloc(PACKET_SIZE, MALLOC_CAP_DMA);
-  safeBuf = (uint8_t*) heap_caps_malloc(PACKET_SIZE, MALLOC_CAP_8BIT);
+  buildMap();
 
   spi_bus_config_t buscfg = {};
   buscfg.mosi_io_num = PIN_MOSI;
@@ -92,12 +139,19 @@ void setup() {
   slvcfg.queue_size = 1;
   slvcfg.mode = 0;
 
-  spi_slave_initialize(VSPI_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+  spi_slave_initialize(
+    VSPI_HOST,
+    &buscfg,
+    &slvcfg,
+    SPI_DMA_CH_AUTO
+  );
 
-  Serial.println("READY");
+  resetFrame();
+
+  Serial.println("ESP READY");
 }
 
-// ---------------- LOOP (FULLY SAFE PIPELINE)
+// ---------------- LOOP ----------------
 void loop() {
 
   memset(&t, 0, sizeof(t));
@@ -105,38 +159,22 @@ void loop() {
   t.length = PACKET_SIZE * 8;
   t.rx_buffer = rxBuf;
 
-  esp_err_t err = spi_slave_transmit(
+  digitalWrite(READY_PIN, HIGH);
+
+  spi_slave_transmit(
     VSPI_HOST,
     &t,
     portMAX_DELAY
   );
 
-  if (err != ESP_OK)
-    return;
+  digitalWrite(READY_PIN, LOW);
 
-  // ---------------- HARD HEADER CHECK
-  if (rxBuf[0] != 0xA5 || rxBuf[1] != 0x5A) {
-    Serial.println("BAD HEADER DROP");
-    return;
+  processPacket(rxBuf);
+
+  // ONLY render when full frame received
+  if (receivedCount >= HEIGHT) {
+
+    renderFrame();
+    resetFrame();
   }
-
-  memcpy(safeBuf, rxBuf, PACKET_SIZE);
-
-  uint8_t row = safeBuf[2];
-
-  if (row >= HEIGHT)
-    return;
-
-  // ---------------- CRC CHECK (PIXEL ONLY)
-  uint16_t rxCRC = (safeBuf[4] << 8) | safeBuf[5];
-  uint16_t calcCRC = crc16(&safeBuf[6], WIDTH * 3);
-
-  if (rxCRC != calcCRC) {
-    Serial.printf("CRC FAIL row=%d DROP\n", row);
-    return;
-  }
-
-  applyRow(safeBuf);
-
-  FastLED.show();
 }
