@@ -9,37 +9,41 @@ const HEIGHT = 64;
 const PACKET_SIZE = 512;
 
 // -----------------------------
+function readReady() {
+  try {
+    const v = execSync(
+      "gpioget --chip gpiochip0 17"
+    )
+    .toString()
+    .trim();
+
+    // your system outputs "17=active"
+    return v.includes("active");
+
+  } catch (e) {
+    return false;
+  }
+}
+
+// -----------------------------
+function waitReady() {
+  while (!readReady()) {
+    // small delay to prevent CPU lockup
+    const start = Date.now();
+    while (Date.now() - start < 1) {}
+  }
+}
+
+// -----------------------------
 function hexToRGB(hex) {
   if (!hex || hex[0] !== "#") return { r: 0, g: 0, b: 0 };
+
   const n = parseInt(hex.slice(1), 16);
   return {
     r: (n >> 16) & 255,
     g: (n >> 8) & 255,
     b: n & 255
   };
-}
-
-// -----------------------------
-// REDUCED POLLING COST
-// (no tight loop spam)
-function waitReady() {
-  let last = 0;
-
-  while (true) {
-
-    const now = Date.now();
-    if (now - last < 5) continue; // throttle CPU
-
-    last = now;
-
-    const val = execSync(
-      "gpioget --chip gpiochip0 17"
-    )
-    .toString()
-    .trim();
-
-    if (val.includes("active")) return;
-  }
 }
 
 // -----------------------------
@@ -53,14 +57,13 @@ function transfer(buf) {
       sendBuffer: buf,
       receiveBuffer: rx,
       byteLength: PACKET_SIZE,
-      speedHz: 100000,
+      speedHz: 2000000, // your known stable value
       mode: 0
     }], () => resolve());
   });
 }
 
 // -----------------------------
-// PREBUILD ROW BUFFER (REUSED)
 function buildRowBuffer(rowData, y) {
 
   const buf = Buffer.alloc(PACKET_SIZE);
@@ -87,6 +90,7 @@ function buildRowBuffer(rowData, y) {
 
 // -----------------------------
 async function fetchFrame() {
+
   const res = await axios.get(
     "https://formplace.yorktechapps.com/api/canvas/full"
   );
@@ -114,7 +118,7 @@ async function loop() {
 
   console.log("FRAME DONE");
 
-  setTimeout(loop, 200);
+  setTimeout(loop, 10);
 }
 
 loop();
